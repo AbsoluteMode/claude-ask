@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "claude-ask": {
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./scripts/server.mjs"
+      ]
+    }
+  }
+}

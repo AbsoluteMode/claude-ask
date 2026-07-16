@@ -1,0 +1,32 @@
+{
+  "name": "claude-ask",
+  "version": "0.1.0+codex.20260716120619",
+  "description": "Ask local Claude Code Fable or Opus models from Codex.",
+  "author": {
+    "name": "max"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "fable",
+    "opus",
+    "consultation"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Claude Ask",
+    "shortDescription": "Ask Claude Fable or Opus from Codex.",
+    "longDescription": "Adds persistent asynchronous consultation tools backed by the locally installed and authenticated Claude Code CLI.",
+    "developerName": "max",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Ask Claude for a second opinion.",
+      "Ask Opus to challenge this approach."
+    ]
+  }
+}
