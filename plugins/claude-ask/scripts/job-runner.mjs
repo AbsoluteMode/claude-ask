@@ -18,21 +18,30 @@ import {
   questionDigest,
   readJson,
   safeClose,
+  validateBudget,
+  validateEffort,
   validateWorkspace,
 } from "./lib.mjs";
 
-const [jobPath, expectedJobId, model] = process.argv.slice(2);
+const [jobPath, expectedJobId, model, requestedEffort] = process.argv.slice(2);
 const paths = jobPaths(jobPath || "");
 let child = null;
+let childProcessGroupId = null;
 let outputFd = null;
+let stderrFd = null;
 let outputBytes = 0;
 let outputTooLarge = false;
+let stderrBytes = 0;
+let stderrTruncated = false;
 let cancelRequested = false;
 let shutdownRequested = false;
 let spawnError = null;
 let completed = false;
 let cancelPoll = null;
-let forceKillTimer = null;
+let stopPromise = null;
+const MAX_STDERR_BYTES = 1024 * 1024;
+const USE_PROCESS_GROUPS = process.platform !== "win32";
+const TERMINATION_GRACE_MS = 5_000;
 
 function writeState(patch) {
   let previous = {};
@@ -44,30 +53,72 @@ function writeState(patch) {
   atomicWriteJson(paths.state, { ...previous, ...patch });
 }
 
-function requestChildStop() {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
-  if (!forceKillTimer) {
-    forceKillTimer = setTimeout(() => {
-      if (child?.exitCode === null && child?.signalCode === null) {
-        child.kill("SIGKILL");
-      }
-    }, 5_000);
-    forceKillTimer.unref();
+function signalChildTree(signal) {
+  if (USE_PROCESS_GROUPS && Number.isSafeInteger(childProcessGroupId)) {
+    try {
+      process.kill(-childProcessGroupId, signal);
+      return;
+    } catch (error) {
+      if (error?.code === "ESRCH") return;
+    }
   }
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    child.kill(signal);
+  } catch {
+    // The process may have exited between the state check and the signal.
+  }
+}
+
+function childTreeExists() {
+  if (USE_PROCESS_GROUPS && Number.isSafeInteger(childProcessGroupId)) {
+    try {
+      process.kill(-childProcessGroupId, 0);
+      return true;
+    } catch (error) {
+      return error?.code === "EPERM";
+    }
+  }
+  return Boolean(
+    child && child.exitCode === null && child.signalCode === null,
+  );
+}
+
+async function waitForChildTreeExit(timeoutMs = null) {
+  const deadline =
+    timeoutMs === null ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+  while (childTreeExists() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !childTreeExists();
+}
+
+function requestChildStop() {
+  if (!child) return Promise.resolve();
+  if (!stopPromise) {
+    stopPromise = (async () => {
+      signalChildTree("SIGTERM");
+      if (await waitForChildTreeExit(TERMINATION_GRACE_MS)) return;
+      signalChildTree("SIGKILL");
+      await waitForChildTreeExit();
+    })();
+  }
+  return stopPromise;
 }
 
 function finishState(status, patch = {}) {
   if (completed) return;
   completed = true;
   if (cancelPoll) clearInterval(cancelPoll);
-  if (forceKillTimer) clearTimeout(forceKillTimer);
   safeClose(outputFd);
   outputFd = null;
+  safeClose(stderrFd);
+  stderrFd = null;
   writeState({
     status,
     completedAt: Date.now(),
     outputBytes,
+    stderrTruncated,
     ...patch,
   });
 }
@@ -79,10 +130,12 @@ async function readPrompt() {
 }
 
 async function main() {
-  if (!jobPath || !expectedJobId || !model) process.exit(2);
+  if (!jobPath || !expectedJobId || !model || !requestedEffort) process.exit(2);
+  const effort = validateEffort(requestedEffort);
   writeState({
     id: expectedJobId,
     model,
+    effort,
     status: "starting",
     runnerPid: process.pid,
   });
@@ -105,8 +158,24 @@ async function main() {
   const expectedBytes = Number(transferHeader?.bytes);
   const expectedDigest = transferHeader?.digest;
   let workspace;
+  let maxBudgetUsd;
+  let resumeSessionId;
   try {
     workspace = validateWorkspace(transferHeader?.workspace);
+    maxBudgetUsd = validateBudget(transferHeader?.maxBudgetUsd);
+    resumeSessionId =
+      typeof transferHeader?.resumeSessionId === "string" &&
+      transferHeader.resumeSessionId.length > 0 &&
+      transferHeader.resumeSessionId.length <= 128
+        ? transferHeader.resumeSessionId
+        : null;
+    if (
+      transferHeader?.resumeSessionId !== null &&
+      transferHeader?.resumeSessionId !== undefined &&
+      resumeSessionId === null
+    ) {
+      throw new Error("Invalid resume session.");
+    }
   } catch {
     transferred.fill(0);
     finishState("error", { errorCode: "workspace_invalid" });
@@ -136,38 +205,66 @@ async function main() {
   }
 
   outputFd = openPrivateFile(paths.stream);
+  stderrFd = openPrivateFile(paths.stderr);
+  const localExecutable = `${homedir()}/.local/bin/claude`;
   const executable =
-    process.env.CLAUDE_ASK_CLI || `${homedir()}/.local/bin/claude`;
-  const readOnlyTools = "Read,Glob,Grep";
-  const args = [
+    process.env.CLAUDE_ASK_CLI ||
+    (existsSync(localExecutable) ? localExecutable : "claude");
+  const commonArgs = [
     "-p",
-    "--safe-mode",
-    "--disable-slash-commands",
     "--model",
     model,
-    "--tools",
-    workspace ? readOnlyTools : "",
-    ...(workspace ? ["--allowedTools", readOnlyTools] : []),
-    "--permission-mode",
-    "dontAsk",
+    "--effort",
+    effort,
     "--output-format",
     "stream-json",
     "--include-partial-messages",
     "--verbose",
     "--input-format",
     "text",
-    "--no-session-persistence",
   ];
+  if (resumeSessionId) {
+    commonArgs.push("--resume", resumeSessionId, "--fork-session");
+  } else {
+    commonArgs.push("--session-id", expectedJobId);
+  }
+  if (maxBudgetUsd !== null) {
+    commonArgs.push("--max-budget-usd", String(maxBudgetUsd));
+  }
+  const args = workspace
+    ? [
+        ...commonArgs,
+        "--tools",
+        "default",
+        "--dangerously-skip-permissions",
+        "--append-system-prompt",
+        "Treat the current working directory as the task scope. Do not access or modify paths outside it unless the user's request explicitly requires that.",
+      ]
+    : [
+        ...commonArgs,
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--tools",
+        "",
+        "--permission-mode",
+        "dontAsk",
+      ];
   child = spawn(executable, args, {
     cwd: workspace || jobPath,
-    env: { ...process.env, CLAUDE_CODE_SAFE_MODE: "1" },
+    env: workspace
+      ? process.env
+      : { ...process.env, CLAUDE_CODE_SAFE_MODE: "1" },
     shell: false,
-    stdio: ["pipe", "pipe", "ignore"],
+    detached: USE_PROCESS_GROUPS,
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  childProcessGroupId = USE_PROCESS_GROUPS ? child.pid || null : null;
   writeState({
     id: expectedJobId,
     model,
+    effort,
     status: "running",
+    mode: workspace ? "agent" : "advisory",
     runnerPid: process.pid,
     claudePid: child.pid || null,
   });
@@ -190,6 +287,16 @@ async function main() {
       requestChildStop();
     }
   });
+  child.stderr.on("data", (chunk) => {
+    if (stderrFd === null || stderrTruncated) return;
+    const remaining = MAX_STDERR_BYTES - stderrBytes;
+    if (remaining > 0) {
+      const value = chunk.subarray(0, remaining);
+      writeSync(stderrFd, value);
+      stderrBytes += value.length;
+    }
+    if (chunk.length > remaining) stderrTruncated = true;
+  });
   child.on("error", (error) => {
     spawnError = error;
   });
@@ -201,15 +308,19 @@ async function main() {
   }, 200);
   cancelPoll.unref();
 
-  child.on("close", (code, signal) => {
+  child.on("close", async (code, signal) => {
     safeClose(outputFd);
     outputFd = null;
+    safeClose(stderrFd);
+    stderrFd = null;
 
     if (cancelRequested || existsSync(paths.cancel)) {
+      await requestChildStop();
       finishState("cancelled", { exitCode: code, signal: signal || null });
       return;
     }
     if (shutdownRequested) {
+      await requestChildStop();
       finishState("error", {
         errorCode: "runner_interrupted",
         exitCode: code,
@@ -218,6 +329,7 @@ async function main() {
       return;
     }
     if (outputTooLarge) {
+      await requestChildStop();
       finishState("error", {
         errorCode: "output_limit_exceeded",
         exitCode: code,
@@ -253,8 +365,10 @@ async function main() {
     }
 
     parsed.result.requested_model = model;
+    parsed.result.requested_effort = effort;
     atomicWriteJson(paths.result, parsed.result);
     finishState("completed", {
+      sessionId: parsed.result.session_id || null,
       exitCode: code,
       signal: signal || null,
     });

@@ -14,7 +14,10 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export const SUPPORTED_MODELS = new Set(["fable", "opus"]);
+export const DEFAULT_MODEL = "sonnet";
+export const DEFAULT_EFFORT = "high";
+export const SUPPORTED_MODELS = new Set(["sonnet", "fable", "opus"]);
+export const SUPPORTED_EFFORTS = new Set(["medium", "high", "xhigh", "max"]);
 export const MAX_QUESTION_CHARS = 200_000;
 export const MAX_OUTPUT_BYTES = boundedInteger(
   process.env.CLAUDE_ASK_MAX_OUTPUT_BYTES,
@@ -51,6 +54,41 @@ export function validateWorkspace(value) {
     throw new Error("Workspace must be a real directory.");
   }
   return canonical;
+}
+
+export function validateJobName(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new Error("Job name must be a string.");
+  }
+  const name = value.trim();
+  if (name.length === 0 || name.length > 120) {
+    throw new Error("Job name must contain 1..120 characters.");
+  }
+  return name;
+}
+
+export function validateEffort(value, fallback = DEFAULT_EFFORT) {
+  const effort = value ?? fallback;
+  if (!SUPPORTED_EFFORTS.has(effort)) {
+    throw new Error("Effort must be `medium`, `high`, `xhigh`, or `max`.");
+  }
+  return effort;
+}
+
+export function validateBudget(value) {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < 0.01 ||
+    value > 1000
+  ) {
+    throw new Error(
+      "Maximum budget must be a finite number from 0.01 through 1000.",
+    );
+  }
+  return value;
 }
 
 function boundedInteger(raw, fallback, minimum, maximum) {
@@ -103,6 +141,7 @@ export function jobPaths(jobPath) {
     state: join(jobPath, "state.json"),
     result: join(jobPath, "result.json"),
     stream: join(jobPath, "stream.jsonl"),
+    stderr: join(jobPath, "stderr.log"),
     cancel: join(jobPath, "cancel.request"),
   };
 }
@@ -197,6 +236,7 @@ export function parseClaudeStream(stdout) {
           ? resultEvent.result
           : JSON.stringify(resultEvent.result ?? ""),
       requested_model: null,
+      requested_effort: null,
       resolved_model: initEvent?.model || null,
       session_id: resultEvent.session_id || initEvent?.session_id || null,
       total_cost_usd: resultEvent.total_cost_usd ?? null,
@@ -215,7 +255,8 @@ export function streamSummary(path) {
       return {
         json_events: 0,
         partial_text_chars: 0,
-        partial_thinking_chars: 0,
+        estimated_thinking_tokens: 0,
+        tool_calls: 0,
         last_event_type: null,
       };
     }
@@ -224,7 +265,8 @@ export function streamSummary(path) {
 
   let jsonEventsCount = 0;
   let partialTextChars = 0;
-  let partialThinkingChars = 0;
+  let estimatedThinkingTokens = 0;
+  let toolCalls = 0;
   let lastEventType = null;
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -242,16 +284,23 @@ export function streamSummary(path) {
       partialTextChars += delta.text.length;
     }
     if (
-      delta?.type === "thinking_delta" &&
-      typeof delta.thinking === "string"
+      item?.type === "system" &&
+      item?.subtype === "thinking_tokens" &&
+      Number.isFinite(item.estimated_tokens_delta)
     ) {
-      partialThinkingChars += delta.thinking.length;
+      estimatedThinkingTokens += item.estimated_tokens_delta;
+    }
+    if (item?.type === "assistant" && Array.isArray(item?.message?.content)) {
+      toolCalls += item.message.content.filter(
+        (content) => content?.type === "tool_use",
+      ).length;
     }
   }
   return {
     json_events: jsonEventsCount,
     partial_text_chars: partialTextChars,
-    partial_thinking_chars: partialThinkingChars,
+    estimated_thinking_tokens: estimatedThinkingTokens,
+    tool_calls: toolCalls,
     last_event_type: lastEventType,
   };
 }

@@ -10,12 +10,15 @@ import {
   readFileSync,
   rmSync,
 } from "node:fs";
+import { uptime } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import {
   atomicWriteJson,
   COMPLETED_JOB_RETENTION_MS,
   createPrivateJobDirectory,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
   ensurePrivateDirectory,
   fileProgress,
   isAuthenticationError,
@@ -29,13 +32,19 @@ import {
   readJson,
   streamSummary,
   SUPPORTED_MODELS,
+  validateBudget,
+  validateEffort,
+  validateJobName,
   validateWorkspace,
 } from "./lib.mjs";
 
 const SERVER_NAME = "claude-ask";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.2.0";
 const RUNNER_PATH = fileURLToPath(new URL("./job-runner.mjs", import.meta.url));
 const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
+const SERVER_BOOT_STARTED_AT = Date.now() - uptime() * 1_000;
+const BOOT_TIME_TOLERANCE_MS = 60_000;
+const STARTUP_GRACE_MS = 5_000;
 
 ensurePrivateDirectory(JOB_DIR);
 
@@ -61,6 +70,17 @@ function toolError(message, structuredContent = null) {
   };
 }
 
+function codedToolError(errorCode, message, nextActionText, extra = {}) {
+  return toolError(message, {
+    ...extra,
+    error_code: errorCode,
+    message,
+    next_action: nextActionText,
+    stderr_tail: null,
+    stderr_truncated: false,
+  });
+}
+
 function processExists(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
@@ -77,12 +97,34 @@ function jobPathById(jobId) {
   return existsSync(path) ? path : null;
 }
 
+function isValidJobState(state, expectedId) {
+  return Boolean(
+    state &&
+      typeof state === "object" &&
+      state.id === expectedId &&
+      SUPPORTED_MODELS.has(state.model) &&
+      ["starting", "running", "completed", "error", "cancelled"].includes(
+        state.status,
+      ) &&
+      Number.isFinite(state.startedAt) &&
+      (state.completedAt === null ||
+        state.completedAt === undefined ||
+        Number.isFinite(state.completedAt)),
+  );
+}
+
 function recoverOrphanedJob(jobPath, state) {
   if (TERMINAL_STATUSES.has(state.status)) return state;
-  if (state.status === "starting" && processExists(state.launcherPid)) {
-    return state;
-  }
-  if (processExists(state.runnerPid)) return state;
+  const recordedBoot = Number(state.bootStartedAt);
+  const sameBoot =
+    !Number.isFinite(recordedBoot) ||
+    Math.abs(recordedBoot - SERVER_BOOT_STARTED_AT) <= BOOT_TIME_TOLERANCE_MS;
+  const withinStartupGrace =
+    state.status === "starting" &&
+    Number.isFinite(state.startedAt) &&
+    Date.now() - state.startedAt < STARTUP_GRACE_MS;
+  if (sameBoot && withinStartupGrace) return state;
+  if (sameBoot && processExists(state.runnerPid)) return state;
 
   const paths = jobPaths(jobPath);
   if (existsSync(paths.cancel)) {
@@ -100,10 +142,12 @@ function recoverOrphanedJob(jobPath, state) {
     const parsed = parseClaudeStream(readFileSync(paths.stream, "utf8"));
     if (!parsed.event?.is_error) {
       parsed.result.requested_model = state.model;
+      parsed.result.requested_effort = state.effort || DEFAULT_EFFORT;
       atomicWriteJson(paths.result, parsed.result);
       const recovered = {
         ...state,
         status: "completed",
+        sessionId: parsed.result.session_id || null,
         completedAt: Date.now(),
         recoveredAfterRestart: true,
       };
@@ -138,7 +182,9 @@ function loadJob(jobId) {
   const path = jobPathById(jobId);
   if (!path) return null;
   try {
-    const state = recoverOrphanedJob(path, readJson(jobPaths(path).state));
+    const storedState = readJson(jobPaths(path).state);
+    if (!isValidJobState(storedState, jobId)) return null;
+    const state = recoverOrphanedJob(path, storedState);
     return { path, paths: jobPaths(path), state };
   } catch {
     return null;
@@ -166,11 +212,39 @@ function cleanupExpiredJobs() {
   }
 }
 
-async function startClaudeJob(question, model, workspace) {
+async function waitForRunnerStart(paths, timeoutMs = 2_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const state = readJson(paths.state);
+      if (
+        state.status === "running" ||
+        TERMINAL_STATUSES.has(state.status)
+      ) {
+        return;
+      }
+    } catch {
+      // The runner may be between atomic state-file updates.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function startClaudeJob({
+  question,
+  model,
+  workspace,
+  name = null,
+  effort = DEFAULT_EFFORT,
+  maxBudgetUsd = null,
+  parentJobId = null,
+  resumeSessionId = null,
+}) {
   if (runningJobCount() >= MAX_CONCURRENT_JOBS) {
-    return toolError(
-      `Claude Ask already has ${MAX_CONCURRENT_JOBS} concurrent jobs. ` +
-        "Wait for one to finish or cancel one explicitly.",
+    return codedToolError(
+      "concurrency_limit",
+      `Claude Ask already has ${MAX_CONCURRENT_JOBS} concurrent jobs.`,
+      "Wait for one to finish or cancel one explicitly.",
     );
   }
 
@@ -181,19 +255,27 @@ async function startClaudeJob(question, model, workspace) {
   const digest = questionDigest(question);
   atomicWriteJson(paths.state, {
     id: job.id,
+    name,
     model,
+    effort,
+    maxBudgetUsd,
+    parentJobId,
+    sessionId: null,
+    resumable: true,
     status: "starting",
     startedAt,
     completedAt: null,
+    bootStartedAt: SERVER_BOOT_STARTED_AT,
     runnerPid: null,
     claudePid: null,
     launcherPid: process.pid,
     workspace,
+    mode: workspace ? "agent" : "advisory",
   });
 
   const runner = spawn(
     process.execPath,
-    [RUNNER_PATH, job.path, job.id, model],
+    [RUNNER_PATH, job.path, job.id, model, effort],
     {
       cwd: job.path,
       env: process.env,
@@ -202,12 +284,23 @@ async function startClaudeJob(question, model, workspace) {
       stdio: ["pipe", "ignore", "ignore"],
     },
   );
+  atomicWriteJson(paths.state, {
+    ...readJson(paths.state),
+    bootStartedAt: SERVER_BOOT_STARTED_AT,
+    runnerPid: Number.isSafeInteger(runner.pid) ? runner.pid : null,
+  });
   await new Promise((resolve, reject) => {
     runner.once("error", reject);
     runner.stdin.once("error", reject);
     runner.stdin.cork();
     runner.stdin.write(
-      `${JSON.stringify({ bytes: questionBytes, digest, workspace })}\n`,
+      `${JSON.stringify({
+        bytes: questionBytes,
+        digest,
+        workspace,
+        maxBudgetUsd,
+        resumeSessionId,
+      })}\n`,
     );
     runner.stdin.end(question, "utf8", resolve);
   }).catch((spawnError) => {
@@ -220,6 +313,7 @@ async function startClaudeJob(question, model, workspace) {
     throw spawnError;
   });
   runner.unref();
+  await waitForRunnerStart(paths);
 
   const loaded = loadJob(job.id);
   return TERMINAL_STATUSES.has(loaded.state.status)
@@ -229,6 +323,15 @@ async function startClaudeJob(question, model, workspace) {
 
 function progressFor(job) {
   return fileProgress(job.paths.stream, job.state.startedAt);
+}
+
+function elapsedFor(job) {
+  const end = job.state.completedAt || Date.now();
+  return Math.max(0, Math.round(end - job.state.startedAt));
+}
+
+function publicStatus(state) {
+  return state.status === "starting" ? "running" : state.status;
 }
 
 function waitForProgress(job, initialBytes, waitMs) {
@@ -263,13 +366,20 @@ function runningResult(job, previousBytes = 0) {
   const summary = streamSummary(job.paths.stream);
   const structuredContent = {
     job_id: job.state.id,
-    status: job.state.status === "starting" ? "running" : job.state.status,
+    name: job.state.name || null,
+    model: job.state.model,
+    parent_job_id: job.state.parentJobId || null,
+    status: publicStatus(job.state),
     progress,
     output_bytes: progressState.bytes,
     delta_bytes: deltaBytes,
     last_growth_ms_ago: Math.max(0, Date.now() - progressState.lastGrowthAt),
     started_at: new Date(job.state.startedAt).toISOString(),
+    elapsed_ms: elapsedFor(job),
     workspace: job.state.workspace || null,
+    mode: job.state.mode || (job.state.workspace ? "agent" : "advisory"),
+    effort: job.state.effort || DEFAULT_EFFORT,
+    max_budget_usd: job.state.maxBudgetUsd ?? null,
     ...summary,
   };
   return {
@@ -305,25 +415,85 @@ function errorMessage(errorCode) {
   return messages[errorCode] || "Claude job failed.";
 }
 
+function nextAction(errorCode) {
+  const actions = {
+    authentication_failed: "Run `claude auth login`, then retry the job.",
+    output_limit_exceeded:
+      "Inspect the workspace because Claude may have changed files before its output was stopped.",
+    workspace_invalid: "Pass an existing absolute workspace directory.",
+    spawn_failed:
+      "Set `CLAUDE_ASK_CLI` to a working Claude executable or add `claude` to PATH.",
+    invalid_stream:
+      "Review stderr_tail and verify that the installed Claude CLI supports stream-json output.",
+    prompt_transfer_failed:
+      "Retry the job; if the error repeats, verify that the plugin server and runner files are from the same version.",
+    runner_spawn_failed:
+      "Verify the Node.js runtime and plugin files, then retry the job.",
+    runner_interrupted:
+      "Inspect the workspace for partial changes, then retry the job.",
+    runner_failed:
+      "Verify the plugin files and runtime, then retry the job.",
+  };
+  return actions[errorCode] || "Review stderr_tail, correct the cause, and retry.";
+}
+
+function stderrTail(job, maximumBytes = 4096) {
+  try {
+    const stderr = readFileSync(job.paths.stderr);
+    const decoded = stderr
+      .subarray(Math.max(0, stderr.length - maximumBytes))
+      .toString("utf8");
+    if (Buffer.byteLength(decoded, "utf8") <= maximumBytes) return decoded;
+
+    let low = 0;
+    let high = decoded.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (Buffer.byteLength(decoded.slice(middle), "utf8") > maximumBytes) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    return decoded.slice(low);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return null;
+  }
+}
+
 function finalJobResult(job) {
   const progressState = progressFor(job);
   const base = {
     job_id: job.state.id,
+    name: job.state.name || null,
+    model: job.state.model,
+    parent_job_id: job.state.parentJobId || null,
     status: job.state.status,
     output_bytes: progressState.bytes,
     started_at: new Date(job.state.startedAt).toISOString(),
     workspace: job.state.workspace || null,
+    mode: job.state.mode || (job.state.workspace ? "agent" : "advisory"),
+    effort: job.state.effort || DEFAULT_EFFORT,
+    max_budget_usd: job.state.maxBudgetUsd ?? null,
     completed_at: job.state.completedAt
       ? new Date(job.state.completedAt).toISOString()
       : null,
+    elapsed_ms: elapsedFor(job),
     recovered_after_restart: Boolean(job.state.recoveredAfterRestart),
+    ...streamSummary(job.paths.stream),
   };
   if (job.state.status === "completed") {
     let answer;
     try {
       answer = readJson(job.paths.result);
     } catch {
-      return toolError("Claude result file is unavailable.", base);
+      return codedToolError(
+        "result_unavailable",
+        "Claude result file is unavailable.",
+        "Retry the job because its completed result cannot be read.",
+        base,
+      );
     }
     return {
       content: [{ type: "text", text: answer.answer }],
@@ -332,9 +502,23 @@ function finalJobResult(job) {
     };
   }
   if (job.state.status === "cancelled") {
-    return toolError(`Claude job ${job.state.id} was cancelled.`, base);
+    return codedToolError(
+      "cancelled",
+      `Claude job ${job.state.id} was cancelled.`,
+      "Start a new job if the work is still needed.",
+      base,
+    );
   }
-  return toolError(errorMessage(job.state.errorCode), base);
+  const errorCode = job.state.errorCode || "unknown_error";
+  const message = errorMessage(errorCode);
+  return toolError(message, {
+    ...base,
+    error_code: errorCode,
+    message,
+    next_action: nextAction(errorCode),
+    stderr_tail: stderrTail(job),
+    stderr_truncated: Boolean(job.state.stderrTruncated),
+  });
 }
 
 async function handleToolCall(params) {
@@ -343,38 +527,171 @@ async function handleToolCall(params) {
 
   if (toolName === "ask") {
     const question = args.question;
-    const model = args.model || "fable";
+    const model = args.model || DEFAULT_MODEL;
     let workspace;
+    let name;
+    let effort;
+    let maxBudgetUsd;
     if (typeof question !== "string" || question.trim().length === 0) {
-      return toolError("`question` must be a non-empty string.");
+      return codedToolError(
+        "invalid_request",
+        "`question` must be a non-empty string.",
+        "Pass a non-empty `question`.",
+      );
     }
     if (question.length > MAX_QUESTION_CHARS) {
-      return toolError(
+      return codedToolError(
+        "invalid_request",
         `Question exceeds the ${MAX_QUESTION_CHARS}-character limit.`,
+        "Shorten the question and retry.",
       );
     }
     if (!SUPPORTED_MODELS.has(model)) {
-      return toolError("`model` must be `fable` or `opus`.");
-    }
-    try {
-      workspace = validateWorkspace(args.workspace);
-    } catch (workspaceError) {
-      return toolError(
-        workspaceError instanceof Error
-          ? workspaceError.message
-          : "Invalid workspace path.",
+      return codedToolError(
+        "invalid_request",
+        "`model` must be `sonnet`, `fable`, or `opus`.",
+        "Choose a supported model alias.",
       );
     }
     try {
-      return await startClaudeJob(question, model, workspace);
+      workspace = validateWorkspace(args.workspace);
+      name = validateJobName(args.name);
+      effort = validateEffort(args.effort);
+      maxBudgetUsd = validateBudget(args.max_budget_usd);
+    } catch (workspaceError) {
+      return codedToolError(
+        "invalid_request",
+        workspaceError instanceof Error
+          ? workspaceError.message
+          : "Invalid workspace path.",
+        "Correct the request options and retry.",
+      );
+    }
+    try {
+      return await startClaudeJob({
+        question,
+        model,
+        workspace,
+        name,
+        effort,
+        maxBudgetUsd,
+      });
     } catch {
-      return toolError("Claude Ask could not start the background job.");
+      return codedToolError(
+        "job_start_failed",
+        "Claude Ask could not start the background job.",
+        "Verify the plugin runtime and retry.",
+      );
+    }
+  }
+
+  if (toolName === "ask_followup") {
+    const parent = loadJob(args.job_id);
+    if (!parent) {
+      return codedToolError(
+        "session_unavailable",
+        "Unknown or expired parent Claude job ID.",
+        "Start a new Claude job with `ask`.",
+      );
+    }
+    if (parent.state.status !== "completed") {
+      return codedToolError(
+        "parent_not_completed",
+        "Parent Claude job must be completed successfully.",
+        "Wait for a successful completed parent or start a new job.",
+      );
+    }
+    if (parent.state.resumable !== true) {
+      return codedToolError(
+        "session_unavailable",
+        "Parent Claude session is unavailable for follow-up.",
+        "Start a new Claude job with `ask`.",
+      );
+    }
+
+    let parentResult;
+    try {
+      parentResult = readJson(parent.paths.result);
+    } catch {
+      return codedToolError(
+        "session_unavailable",
+        "Parent Claude result is unavailable.",
+        "Start a new Claude job with `ask`.",
+      );
+    }
+    if (
+      typeof parentResult.session_id !== "string" ||
+      parentResult.session_id.length === 0
+    ) {
+      return codedToolError(
+        "session_unavailable",
+        "Parent Claude session is unavailable for follow-up.",
+        "Start a new Claude job with `ask`.",
+      );
+    }
+
+    const question = args.question;
+    if (typeof question !== "string" || question.trim().length === 0) {
+      return codedToolError(
+        "invalid_request",
+        "`question` must be a non-empty string.",
+        "Pass a non-empty `question`.",
+      );
+    }
+    if (question.length > MAX_QUESTION_CHARS) {
+      return codedToolError(
+        "invalid_request",
+        `Question exceeds the ${MAX_QUESTION_CHARS}-character limit.`,
+        "Shorten the question and retry.",
+      );
+    }
+
+    let name;
+    let effort;
+    let maxBudgetUsd;
+    try {
+      name = validateJobName(args.name);
+      effort = validateEffort(args.effort, parent.state.effort || DEFAULT_EFFORT);
+      maxBudgetUsd = validateBudget(args.max_budget_usd);
+    } catch (validationError) {
+      return codedToolError(
+        "invalid_request",
+        validationError instanceof Error
+          ? validationError.message
+          : "Invalid follow-up options.",
+        "Correct the follow-up options and retry.",
+      );
+    }
+
+    try {
+      return await startClaudeJob({
+        question,
+        model: parent.state.model,
+        workspace: parent.state.workspace || null,
+        name,
+        effort,
+        maxBudgetUsd,
+        parentJobId: parent.state.id,
+        resumeSessionId: parentResult.session_id,
+      });
+    } catch {
+      return codedToolError(
+        "job_start_failed",
+        "Claude Ask could not start the follow-up job.",
+        "Verify the plugin runtime and retry.",
+      );
     }
   }
 
   if (toolName === "ask_status") {
     let job = loadJob(args.job_id);
-    if (!job) return toolError("Unknown or expired Claude job ID.");
+    if (!job) {
+      return codedToolError(
+        "job_not_found",
+        "Unknown or expired Claude job ID.",
+        "Use `list_jobs` to recover a recent job ID or start a new job.",
+      );
+    }
     const waitMs = Number.isInteger(args.wait_ms)
       ? Math.max(0, Math.min(args.wait_ms, 30_000))
       : 10_000;
@@ -384,15 +701,107 @@ async function handleToolCall(params) {
       : currentBytes;
     await waitForProgress(job, previousBytes, waitMs);
     job = loadJob(args.job_id);
-    if (!job) return toolError("Claude job expired while checking status.");
+    if (!job) {
+      return codedToolError(
+        "job_not_found",
+        "Claude job expired while checking status.",
+        "Use `list_jobs` or start a new job.",
+      );
+    }
     return TERMINAL_STATUSES.has(job.state.status)
       ? finalJobResult(job)
       : runningResult(job, previousBytes);
   }
 
+  if (toolName === "list_jobs") {
+    const limit =
+      args.limit === undefined
+        ? 20
+        : Number.isInteger(args.limit) && args.limit >= 1 && args.limit <= 100
+          ? args.limit
+          : null;
+    if (limit === null) {
+      return codedToolError(
+        "invalid_request",
+        "`limit` must be an integer from 1 through 100.",
+        "Pass a `limit` from 1 through 100.",
+      );
+    }
+    const allowedStatuses = new Set([
+      "running",
+      "completed",
+      "error",
+      "cancelled",
+    ]);
+    if (
+      args.status !== undefined &&
+      (typeof args.status !== "string" || !allowedStatuses.has(args.status))
+    ) {
+      return codedToolError(
+        "invalid_request",
+        "`status` must be `running`, `completed`, `error`, or `cancelled`.",
+        "Choose one of the supported status filters.",
+      );
+    }
+
+    const jobs = [];
+    for (const entry of readdirSync(JOB_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !JOB_ID_PATTERN.test(entry.name)) continue;
+      const job = loadJob(entry.name);
+      if (!job) continue;
+      const status = publicStatus(job.state);
+      if (args.status !== undefined && status !== args.status) continue;
+
+      const summary = {
+        job_id: job.state.id,
+        name: job.state.name || null,
+        status,
+        model: job.state.model,
+        effort: job.state.effort || DEFAULT_EFFORT,
+        mode: job.state.mode || (job.state.workspace ? "agent" : "advisory"),
+        workspace: job.state.workspace || null,
+        parent_job_id: job.state.parentJobId || null,
+        started_at: new Date(job.state.startedAt).toISOString(),
+        completed_at: job.state.completedAt
+          ? new Date(job.state.completedAt).toISOString()
+          : null,
+        elapsed_ms: elapsedFor(job),
+      };
+      if (status === "completed") {
+        try {
+          const completed = readJson(job.paths.result);
+          if (Number.isFinite(completed.total_cost_usd)) {
+            summary.total_cost_usd = completed.total_cost_usd;
+          }
+        } catch {
+          // A corrupt result does not make the rest of the job list unusable.
+        }
+      }
+      jobs.push({ startedAt: job.state.startedAt, summary });
+    }
+    jobs.sort((left, right) => right.startedAt - left.startedAt);
+    const summaries = jobs.slice(0, limit).map((job) => job.summary);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Found ${summaries.length} recent Claude jobs.`,
+        },
+      ],
+      structuredContent: { jobs: summaries },
+      isError: false,
+    };
+  }
+
   if (toolName === "cancel_ask") {
     const job = loadJob(args.job_id);
-    if (!job) return toolError("Unknown or expired Claude job ID.");
+    if (!job) {
+      return codedToolError(
+        "job_not_found",
+        "Unknown or expired Claude job ID.",
+        "Use `list_jobs` to recover a recent job ID.",
+      );
+    }
     if (!TERMINAL_STATUSES.has(job.state.status)) {
       try {
         const fd = openSync(job.paths.cancel, "wx", 0o600);
@@ -400,7 +809,11 @@ async function handleToolCall(params) {
         closeSync(fd);
       } catch (error) {
         if (error?.code !== "EEXIST") {
-          return toolError("Could not request Claude job cancellation.");
+          return codedToolError(
+            "cancel_request_failed",
+            "Could not request Claude job cancellation.",
+            "Check job-directory permissions and retry.",
+          );
         }
       }
       return {
@@ -414,7 +827,11 @@ async function handleToolCall(params) {
     return finalJobResult(job);
   }
 
-  return toolError(`Unknown tool: ${toolName || "<missing>"}`);
+  return codedToolError(
+    "unknown_tool",
+    `Unknown tool: ${toolName || "<missing>"}`,
+    "Call one of the tools returned by `tools/list`.",
+  );
 }
 
 async function handleRequest(message) {
@@ -426,7 +843,7 @@ async function handleRequest(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        "Start Claude with ask, explicitly pass workspace for repository reviews, then poll ask_status until the final answer. Workspace jobs get read-only file discovery tools. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit.",
+        "Start Claude with ask and poll ask_status until the final answer. Use ask_followup to fork a completed session and list_jobs to recover job IDs. Pass workspace to run Claude Code as a full autonomous agent with its default tools, shell, editing, inherited user/project instructions and hooks, configured MCP servers, skills, plugins, network access, and permission to modify the workspace. Without workspace it receives only the question and no tools. Workspace is the working directory and intended task scope, not an OS sandbox. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit.",
     });
     return;
   }
@@ -443,7 +860,7 @@ async function handleRequest(message) {
           name: "ask",
           title: "Ask Claude",
           description:
-            "Start a persistent background Claude Code Fable or Opus consultation. Pass an absolute workspace path when Claude should inspect a repository; only Read, Glob, and Grep are enabled for that job. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
+            "Start a persistent background Claude Code job using Sonnet at high effort by default, with configurable effort plus Fable and Opus. With workspace, Claude runs as a full autonomous coding agent with default tools, shell commands, file editing, inherited user/project instructions and hooks, configured MCP servers, skills, and plugins, network access, and permission to modify files. Without workspace it receives only the question and no tools. The workspace is its working directory and intended task scope, not a hard OS sandbox. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
           inputSchema: {
             type: "object",
             properties: {
@@ -455,8 +872,8 @@ async function handleRequest(message) {
               },
               model: {
                 type: "string",
-                enum: ["fable", "opus"],
-                default: "fable",
+                enum: ["sonnet", "fable", "opus"],
+                default: DEFAULT_MODEL,
                 description: "Claude Code model alias.",
               },
               workspace: {
@@ -464,15 +881,72 @@ async function handleRequest(message) {
                 minLength: 1,
                 maxLength: 4096,
                 description:
-                  "Absolute existing workspace directory. Enables read-only Read, Glob, and Grep tools scoped by Claude Code permissions to this directory.",
+                  "Absolute existing working directory. Enables full autonomous Claude Code agent capabilities, including shell and file writes. This is the intended task scope, not a hard OS sandbox.",
+              },
+              name: {
+                type: "string",
+                minLength: 1,
+                maxLength: 120,
+                description: "Optional human-readable job name.",
+              },
+              effort: {
+                type: "string",
+                enum: ["medium", "high", "xhigh", "max"],
+                default: DEFAULT_EFFORT,
+                description: "Claude Code reasoning effort.",
+              },
+              max_budget_usd: {
+                type: "number",
+                minimum: 0.01,
+                maximum: 1000,
+                description: "Optional Claude Code cost ceiling for this job.",
               },
             },
             required: ["question"],
             additionalProperties: false,
           },
           annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: false,
+            openWorldHint: true,
+          },
+        },
+        {
+          name: "ask_followup",
+          title: "Continue Claude Job",
+          description:
+            "Start a persistent follow-up from a completed Claude job. It inherits the parent model, workspace, mode, and full session context while creating an independent session branch.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              job_id: { type: "string", minLength: 1 },
+              question: {
+                type: "string",
+                minLength: 1,
+                maxLength: MAX_QUESTION_CHARS,
+              },
+              name: {
+                type: "string",
+                minLength: 1,
+                maxLength: 120,
+              },
+              effort: {
+                type: "string",
+                enum: ["medium", "high", "xhigh", "max"],
+              },
+              max_budget_usd: {
+                type: "number",
+                minimum: 0.01,
+                maximum: 1000,
+              },
+            },
+            required: ["job_id", "question"],
+            additionalProperties: false,
+          },
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
             idempotentHint: false,
             openWorldHint: true,
           },
@@ -506,6 +980,34 @@ async function handleRequest(message) {
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: true,
+          },
+        },
+        {
+          name: "list_jobs",
+          title: "List Claude Jobs",
+          description:
+            "List recent persistent Claude jobs newest first so lost job IDs can be recovered.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              limit: {
+                type: "integer",
+                minimum: 1,
+                maximum: 100,
+                default: 20,
+              },
+              status: {
+                type: "string",
+                enum: ["running", "completed", "error", "cancelled"],
+              },
+            },
+            additionalProperties: false,
+          },
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
           },
         },
         {

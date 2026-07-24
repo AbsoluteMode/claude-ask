@@ -1,67 +1,67 @@
 # Claude Ask
 
-A personal Codex plugin exposing asynchronous MCP tools backed by the local
-Claude Code CLI.
+A personal Codex plugin that exposes local Claude Code Sonnet 5, Fable, and Opus as persistent asynchronous MCP jobs.
 
-The caller supplies the complete prompt and chooses `fable` or `opus`. For
-ordinary consultations Claude runs with `--safe-mode` and no tools. For a code
-review, the caller may pass an explicit absolute `workspace`; Claude then runs
-with that directory as its real working directory and receives only the
-built-in `Read`, `Glob`, and `Grep` tools. It cannot edit files or run shell
-commands.
+Sonnet with `high` effort is the default. Each job can select `medium`, `high`, `xhigh`, or `max` effort, set a human-readable name, and enforce a `max_budget_usd` ceiling.
 
-`ask` starts a detached background job and immediately returns a `job_id`.
-Claude uses streaming JSON with partial messages and writes model output to a
-private progress file. Poll `ask_status` until the file-backed job completes;
-each response reports byte growth plus recent stream-event, partial-text, and
-partial-thinking counters. There is no elapsed-time or idle-time deadline. An
-unchanged file is a waiting job, never an automatic cancellation signal.
+## Tools
 
-This asynchronous contract keeps every MCP `tools/call` short. The detached
-runner survives an MCP server restart and the same `job_id` remains queryable.
-A machine reboot or runner crash is reported explicitly as an interrupted job;
-it is never presented as a model answer. Only explicit `cancel_ask`, the output
-safety limit, Claude/runner failure, or operating-system termination ends work.
+| Tool | Purpose |
+|---|---|
+| `ask` | Start a new advisory or workspace-agent job |
+| `ask_followup` | Resume a completed job's Claude session and fork an independent branch |
+| `ask_status` | Wait for progress or retrieve the terminal result |
+| `list_jobs` | List recent jobs and recover lost IDs |
+| `cancel_ask` | Explicitly cancel a running job and its process tree |
 
-Job directories are mode 0700 and every state, result, cancel, and stream file
-is mode 0600. The prompt is never put in argv, environment variables, state, or
-diagnostic logs: it goes directly to the runner and Claude over stdin. Claude's
-private output stream and completed result are retained for 24 hours, then
-removed. At most four jobs run concurrently by default.
+`ask` returns a `job_id` immediately. Poll `ask_status` until the status is `completed`, `error`, or `cancelled`. There is no elapsed-time or idle-time deadline; unchanged output means the job is still waiting. Progress includes output bytes, estimated thinking tokens, tool-call count, elapsed time, and the last event type.
 
-## Requirements
+Completed sessions remain resumable in Claude Code's normal session storage, outside the plugin job directory and its 24-hour cleanup. `ask_followup` inherits the parent model, workspace, mode, and effort unless effort is overridden. It uses Claude Code resume-and-fork semantics, so the parent remains unchanged. A budget applies only to the new call.
 
-- Claude Code available at `~/.local/bin/claude`, or set `CLAUDE_ASK_CLI`.
+## Access modes
+
+Without `workspace`, Claude runs in advisory safe mode with no tools and receives only the supplied question.
+
+With an explicit absolute `workspace`, Claude runs as a full autonomous coding agent. Its normal default tools, shell, file editing, user/project instructions and hooks, network access, and configured MCP servers, skills, and plugins remain available. Interactive permission prompts are bypassed because a detached job cannot answer them.
+
+The workspace is Claude's actual working directory and intended task scope, not a hard operating-system sandbox. Claude runs as the current user and can technically access other paths and the network. Only pass trusted workspaces and prompts.
+
+Example:
+
+```json
+{
+  "question": "Investigate the failure, implement a fix, run the relevant tests, and summarize the result.",
+  "model": "sonnet",
+  "workspace": "/absolute/path/to/repository",
+  "name": "fix flaky integration test",
+  "effort": "high",
+  "max_budget_usd": 5
+}
+```
+
+## Persistence and diagnostics
+
+Jobs survive MCP server restarts and remain queryable by ID. Boot-aware recovery distinguishes a live detached runner from an interrupted job. Cancellation signals Claude's whole process group on POSIX systems, with a direct-child fallback on Windows.
+
+Errors return structured `error_code`, `next_action`, `stderr_tail`, and `stderr_truncated` fields. Claude stderr is stored privately up to 1 MiB; only a bounded 4 KiB tail is returned. Output-limit errors warn that workspace changes may already exist.
+
+Job directories use mode 0700; state, result, stream, stderr, and cancellation files use mode 0600. Prompts never appear in argv, environment variables, state, or diagnostic logs: they travel over stdin. Completed data is retained for 24 hours by default. Up to four jobs run concurrently.
+
+## Requirements and tests
+
+- Claude Code on `PATH` or at `~/.local/bin/claude`; alternatively set `CLAUDE_ASK_CLI`.
 - A working Claude Code login (`claude auth status`).
 
-## Test
+Run the no-usage test suite:
 
 ```bash
 node scripts/test-server.mjs
 ```
 
-The test uses a fake Claude executable and does not consume model usage.
+An authenticated paid/limited-usage smoke test is opt-in:
 
-After authenticating Claude Code, an explicit paid/limited-usage smoke test is available with `CLAUDE_ASK_LIVE=1 node scripts/test-server.mjs`.
-
-Optional controls are `CLAUDE_ASK_JOB_DIR`,
-`CLAUDE_ASK_MAX_CONCURRENT_JOBS`, `CLAUDE_ASK_MAX_OUTPUT_BYTES`, and
-`CLAUDE_ASK_COMPLETED_RETENTION_MS`. None of them is a wall-clock or idle
-deadline.
-
-## Workspace reviews
-
-The `ask` input accepts:
-
-```json
-{
-  "question": "Review the current implementation and report blockers.",
-  "model": "fable",
-  "workspace": "/absolute/path/to/repository"
-}
+```bash
+CLAUDE_ASK_LIVE=1 node scripts/test-server.mjs
 ```
 
-The workspace must already exist and be an absolute directory. It is
-canonicalized before the job starts, recorded in private job state for audit,
-and returned by `ask_status`. Workspace access is opt-in per job; no global
-working-directory environment variable is used.
+Optional controls are `CLAUDE_ASK_JOB_DIR`, `CLAUDE_ASK_MAX_CONCURRENT_JOBS`, `CLAUDE_ASK_MAX_OUTPUT_BYTES`, and `CLAUDE_ASK_COMPLETED_RETENTION_MS`. None sets a wall-clock or idle deadline.
