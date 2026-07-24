@@ -1,18 +1,19 @@
 # Claude Ask
 
-Claude Ask is an open-source Codex plugin that asks a locally authenticated
-Claude Code model for an independent second opinion.
+Claude Ask is an open-source Codex plugin that runs a locally authenticated
+Claude Code Sonnet 5, Fable, or Opus model as an independent second opinion or
+full autonomous coding agent.
 
-It provides three MCP tools:
+It provides five persistent asynchronous MCP tools:
 
-- `ask` starts a persistent asynchronous Claude Fable or Opus job;
-- `ask_status` reports progress and returns the final answer;
-- `cancel_ask` explicitly cancels a job.
+- `ask` starts a new advisory or workspace-agent job;
+- `ask_followup` resumes a completed Claude session and forks a new branch;
+- `ask_status` waits for progress or returns the final result;
+- `list_jobs` lists recent jobs and recovers lost IDs;
+- `cancel_ask` explicitly cancels a job and its process tree.
 
-For repository reviews, `ask` accepts an explicit absolute `workspace`. Claude
-runs from that directory with only the built-in `Read`, `Glob`, and `Grep`
-tools. It cannot run shell commands or edit files. Without `workspace`, Claude
-receives no tools.
+Jobs support a human-readable name, `medium | high | xhigh | max` effort
+(`high` by default), and an optional `max_budget_usd` ceiling.
 
 ## Install in Codex
 
@@ -23,38 +24,55 @@ codex plugin marketplace add AbsoluteMode/claude-ask
 codex plugin add claude-ask@absolutmode
 ```
 
-Start a new Codex thread after installation so the new skill and MCP tool
-schema are loaded.
+Start a new Codex task after installing or updating so the skill and MCP tool
+schemas are reloaded.
 
 ## Requirements
 
 - Codex with plugin support;
 - Node.js 22 or newer;
-- Claude Code installed at `~/.local/bin/claude`, or `CLAUDE_ASK_CLI` set to
-  another executable;
+- Claude Code on `PATH` or at `~/.local/bin/claude`;
 - an authenticated Claude Code session.
 
-## Security model
+## Access modes
 
-- The prompt is transferred over stdin, never argv or environment variables.
-- Job directories use mode `0700`; job files use `0600`.
-- Workspace access is explicit per job and canonicalized before launch.
-- Workspace jobs expose only `Read`, `Glob`, and `Grep`.
-- There is no automatic elapsed-time or idle timeout.
-- Jobs survive an MCP server restart and are retained for 24 hours by default.
-- At most four jobs run concurrently by default.
+Without `workspace`, Claude receives only the supplied question and runs in
+safe mode with no tools.
 
-See [the plugin documentation](plugins/claude-ask/README.md) for protocol and
-configuration details.
+With an explicit absolute `workspace`, Claude runs as a full-access coding
+agent. Its default tools, shell, file editing, user/project instructions and
+hooks, network access, and configured MCP servers, skills, and plugins remain
+available. Interactive permission checks are bypassed because the detached
+process cannot answer prompts.
+
+The workspace is Claude's working directory and intended task scope, not a
+hard operating-system sandbox. Only pass trusted workspaces and prompts.
+
+## Reliability and privacy
+
+- Prompts travel over stdin, never argv, environment variables, state, or logs.
+- Job directories use mode `0700`; private files use mode `0600`.
+- Jobs survive MCP server restarts and remain discoverable through `list_jobs`.
+- Boot-aware recovery avoids trusting reused PIDs after a machine restart.
+- Cancellation terminates Claude's POSIX process group with
+  `SIGTERM → SIGKILL`.
+- Stderr is capped at 1 MiB; failures expose at most a 4 KiB diagnostic tail.
+- There is no automatic elapsed-time or idle-time cancellation.
+- Completed plugin job data is retained for 24 hours by default; resumable
+  Claude sessions use Claude Code's normal session storage.
+
+See [the plugin documentation](plugins/claude-ask/README.md) for the complete
+protocol and configuration reference.
 
 ## Development
 
 ```bash
 npm test
+npm run check
 ```
 
-The default test uses a fake Claude executable and consumes no model usage. An
-explicit live smoke test is available after Claude authentication:
+The default suite uses a fake Claude executable and consumes no model usage.
+An authenticated paid/limited-usage smoke test is explicit:
 
 ```bash
 npm run test:live
