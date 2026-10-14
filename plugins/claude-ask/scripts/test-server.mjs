@@ -20,6 +20,7 @@ import {
 import { tmpdir, uptime } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseClaudeStream } from "./lib.mjs";
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = dirname(scriptsDir);
@@ -156,6 +157,20 @@ async function waitForProcessExit(pid, timeoutMs = 2_000) {
 }
 
 async function fakeTests() {
+  const fallbackStream = [
+    { type: "system", subtype: "init", model: "claude-sonnet-5-5" },
+    { type: "assistant", message: { model: "claude-sonnet-5" } },
+    {
+      type: "assistant",
+      parent_tool_use_id: "subagent",
+      message: { model: "claude-haiku-5-5" },
+    },
+    { type: "result", result: "answer", modelUsage: { "claude-sonnet-5": {} } },
+  ].map((event) => JSON.stringify(event)).join("\n");
+  assert.equal(
+    parseClaudeStream(fallbackStream).result.resolved_model,
+    "claude-sonnet-5",
+  );
   const skill = readFileSync(
     join(pluginRoot, "skills", "claude-ask", "SKILL.md"),
     "utf8",
@@ -175,7 +190,7 @@ async function fakeTests() {
   const manifest = JSON.parse(
     readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
   );
-  assert.equal(manifest.version, "0.2.0");
+  assert.equal(manifest.version, "0.3.0");
   assert.ok(
     manifest.interface.defaultPrompt.some((prompt) =>
       /without repository tools/i.test(prompt),
@@ -212,13 +227,13 @@ async function fakeTests() {
   assert.equal(listed.result.tools[0].annotations.readOnlyHint, false);
   assert.equal(listed.result.tools[0].annotations.destructiveHint, true);
   assert.ok(listed.result.tools[0].inputSchema.properties.workspace);
-  assert.deepEqual(
-    listed.result.tools[0].inputSchema.properties.model.enum,
-    ["sonnet", "fable", "opus"],
+  assert.match(
+    "claude-sonnet-5-5",
+    new RegExp(listed.result.tools[0].inputSchema.properties.model.pattern),
   );
   assert.equal(
     listed.result.tools[0].inputSchema.properties.model.default,
-    "sonnet",
+    "claude-opus-5",
   );
 
   const relativeWorkspace = await client.call("ask", {
@@ -241,7 +256,7 @@ async function fakeTests() {
   assert.equal(workspaceResult.result.content[0].text, "WORKSPACE_OK");
   assert.equal(
     workspaceResult.result.structuredContent.requested_model,
-    "sonnet",
+    "claude-opus-5",
   );
   assert.equal(
     workspaceResult.result.structuredContent.requested_effort,
@@ -250,10 +265,40 @@ async function fakeTests() {
   assert.equal(workspaceResult.result.structuredContent.effort, "high");
   assert.equal(
     workspaceResult.result.structuredContent.resolved_model,
-    "claude-sonnet-fake",
+    "claude-claude-opus-5-fake",
   );
   assert.equal(workspaceResult.result.structuredContent.workspace, workspaceRoot);
   assert.equal(workspaceResult.result.structuredContent.mode, "agent");
+
+  const review = await client.call("ask", {
+    question: `review-probe:${workspaceRoot}`,
+    workspace: workspaceRoot,
+    mode: "review",
+    model: "claude-sonnet-5-5",
+    effort: "low",
+  });
+  const reviewJobId = remember(review);
+  await client.stop();
+  client = new McpClient({ CLAUDE_ASK_MAX_CONCURRENT_JOBS: "2" });
+  await client.initialize();
+  const reviewResult = await waitForTerminal(client, reviewJobId);
+  assert.equal(reviewResult.result.isError, false);
+  assert.equal(reviewResult.result.content[0].text, "REVIEW_OK");
+  assert.equal(reviewResult.result.structuredContent.mode, "review");
+  assert.equal(reviewResult.result.structuredContent.requested_model, "claude-sonnet-5-5");
+  assert.equal(reviewResult.result.structuredContent.requested_effort, "low");
+  const reviewFollowup = await client.call("ask_followup", {
+    job_id: reviewJobId,
+    question: "review-recall",
+  });
+  const reviewFollowupResult = await waitForTerminal(
+    client, remember(reviewFollowup),
+  );
+  assert.equal(reviewFollowupResult.result.isError, false);
+  assert.equal(reviewFollowupResult.result.content[0].text, "REVIEW_FOLLOWUP_OK");
+  assert.equal(reviewFollowupResult.result.structuredContent.mode, "review");
+  assert.equal(reviewFollowupResult.result.structuredContent.requested_model, "claude-sonnet-5-5");
+  assert.equal(reviewFollowupResult.result.structuredContent.requested_effort, "low");
 
   const defaultEffort = await client.call("ask", {
     question: "default-effort-probe",
@@ -305,7 +350,15 @@ async function fakeTests() {
 
   for (const argumentsValue of [
     { question: "x", name: "   " },
-    { question: "x", effort: "low" },
+    { question: "x", effort: "extreme" },
+    { question: "x", model: "--dangerously-skip-permissions" },
+    { question: "x", model: "sonnet;whoami" },
+    { question: "x", model: "" },
+    { question: "x", model: "sonnet\n" },
+    { question: "x", mode: "review" },
+    { question: "x", mode: "agent" },
+    { question: "x", mode: "advisory", workspace: workspaceRoot },
+    { question: "x", mode: "unknown", workspace: workspaceRoot },
     { question: "x", max_budget_usd: 0 },
     { question: "x", max_budget_usd: "1" },
   ]) {
@@ -826,6 +879,7 @@ async function liveTest() {
     await client.initialize();
     const started = await client.call("ask", {
       question: "Ответь ровно: CLAUDE_ASK_LIVE_OK",
+      model: "sonnet",
     });
     const jobId = remember(started);
     const completed = await waitForTerminal(client, jobId);
@@ -901,6 +955,98 @@ async function liveTest() {
   }
 }
 
+async function liveReviewTest() {
+  const workspace = realpathSync(process.env.CLAUDE_ASK_LIVE_REVIEW_WORKSPACE);
+  const model = process.env.CLAUDE_ASK_LIVE_MODEL || "claude-sonnet-5-5";
+  const memoryNonce = `REVIEW_MEMORY_${randomUUID()}`;
+  let client = new McpClient();
+  try {
+    await client.initialize();
+    const started = await client.call("ask", {
+      question:
+        "Read change.patch, then read the affected source and tests. Review this change for correctness and regressions. Do not edit files. Report only actionable issues introduced by the patch, with file paths, line numbers, and a concrete failure scenario. If none are supported, say so. End with a short description of what you inspected and any validation limits. " +
+        `Remember this nonce for a later follow-up: ${memoryNonce}.`,
+      model,
+      mode: "review",
+      workspace,
+      name: "Sonnet 5.5 review of recent change",
+      effort: "high",
+      max_budget_usd: 5,
+    });
+    assert.equal(started.result.isError, false);
+    const jobId = remember(started);
+    assert.equal(started.result.structuredContent.status, "running");
+    process.stdout.write(`Review job started: ${jobId}; restarting MCP server\n`);
+    await client.stop();
+    client = new McpClient();
+    await client.initialize();
+    const discovered = await client.call("list_jobs", {});
+    assert.ok(discovered.result.structuredContent.jobs.some(
+      (job) => job.job_id === jobId,
+    ));
+    const completed = await waitForTerminal(client, jobId);
+    assert.equal(completed.result.isError, false, JSON.stringify(completed.result));
+    assert.equal(completed.result.structuredContent.mode, "review");
+    assert.equal(completed.result.structuredContent.requested_model, model);
+    assert.match(completed.result.structuredContent.resolved_model, /sonnet[-.]5[-.]5/i);
+    assert.ok(
+      Object.keys(completed.result.structuredContent.model_usage || {})
+        .some((name) => /sonnet[-.]5[-.]5/i.test(name)),
+      "Usage must confirm Sonnet 5.5 actually answered.",
+    );
+    const events = readFileSync(join(jobRoot, jobId, "stream.jsonl"), "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const tools = events.flatMap((event) => event.type === "assistant"
+      ? (event.message?.content || []).filter((block) => block.type === "tool_use").map((block) => block.name)
+      : []);
+    assert.ok(
+      tools.includes("Read"),
+      "The review must inspect the actual patch and source files.",
+    );
+    assert.ok(
+      tools.every((tool) => ["Read", "Glob", "Grep"].includes(tool)),
+      JSON.stringify(tools),
+    );
+    process.stdout.write(`Review completed on ${completed.result.structuredContent.resolved_model}; checking follow-up\n`);
+    const followup = await client.call("ask_followup", {
+      job_id: jobId,
+      question: "Without reading any files, recall the nonce from my first request, then summarize the purpose of the change you just reviewed in one sentence.",
+      name: "Review continuation after MCP reconnect",
+      max_budget_usd: 5,
+    });
+    const continued = await waitForTerminal(client, remember(followup));
+    assert.equal(continued.result.isError, false, JSON.stringify(continued.result));
+    assert.match(continued.result.content[0].text, new RegExp(memoryNonce));
+    assert.equal(continued.result.structuredContent.parent_job_id, jobId);
+    assert.equal(continued.result.structuredContent.mode, "review");
+    assert.equal(continued.result.structuredContent.requested_model, model);
+    assert.notEqual(
+      continued.result.structuredContent.session_id,
+      completed.result.structuredContent.session_id,
+    );
+    const evidence = {
+      reviewed_patch_sha256: sha256(readFileSync(join(workspace, "change.patch"))),
+      review: completed.result.structuredContent,
+      followup: continued.result.structuredContent,
+      review_tools: tools,
+      mcp_restart_survived: true,
+      context_recalled: true,
+    };
+    if (process.env.CLAUDE_ASK_LIVE_RESULT_PATH) {
+      writeFileSync(
+        process.env.CLAUDE_ASK_LIVE_RESULT_PATH,
+        JSON.stringify(evidence, null, 2) + "\n",
+        { mode: 0o600 },
+      );
+    }
+    process.stdout.write(JSON.stringify(evidence, null, 2) + "\n");
+  } finally {
+    await client.stop();
+  }
+}
+
 async function cleanup() {
   if (!existsSync(jobRoot)) return;
   for (const entry of readdirSync(jobRoot, { withFileTypes: true })) {
@@ -917,10 +1063,18 @@ async function cleanup() {
   rmSync(jobRoot, { recursive: true, force: true });
 }
 
+let succeeded = false;
 try {
-  if (live) await liveTest();
+  if (live && process.env.CLAUDE_ASK_LIVE_REVIEW_WORKSPACE) {
+    await liveReviewTest();
+  }
+  else if (live) await liveTest();
   else await fakeTests();
+  succeeded = true;
   process.stdout.write(`claude-ask MCP ${live ? "live " : ""}test passed\n`);
 } finally {
-  await cleanup();
+  if (!live || succeeded) await cleanup();
+  else process.stderr.write(
+    `Live job diagnostics retained at ${jobRoot}; running jobs were not cancelled.\n`,
+  );
 }

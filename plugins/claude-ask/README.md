@@ -1,14 +1,14 @@
 # Claude Ask
 
-A personal Codex plugin that exposes local Claude Code Sonnet 5, Fable, and Opus as persistent asynchronous MCP jobs.
+A personal Codex plugin that exposes locally authenticated Claude Code models as persistent asynchronous MCP jobs.
 
-Sonnet with `high` effort is the default. Each job can select `medium`, `high`, `xhigh`, or `max` effort, set a human-readable name, and enforce a `max_budget_usd` ceiling.
+`claude-opus-5` with `high` effort is the default, preserving the existing personal installation. Model aliases and full model IDs such as `claude-sonnet-5-5` are accepted. Each job can select `low`, `medium`, `high`, `xhigh`, or `max` effort, set a human-readable name, and enforce a `max_budget_usd` ceiling.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `ask` | Start a new advisory or workspace-agent job |
+| `ask` | Start an advisory, read-only review, or workspace-agent job |
 | `ask_followup` | Resume a completed job's Claude session and fork an independent branch |
 | `ask_status` | Wait for progress or retrieve the terminal result |
 | `list_jobs` | List recent jobs and recover lost IDs |
@@ -22,7 +22,9 @@ Completed sessions remain resumable in Claude Code's normal session storage, out
 
 Without `workspace`, Claude runs in advisory safe mode with no tools and receives only the supplied question.
 
-With an explicit absolute `workspace`, Claude runs as a full autonomous coding agent. Its normal default tools, shell, file editing, user/project instructions and hooks, network access, and configured MCP servers, skills, and plugins remain available. Interactive permission prompts are bypassed because a detached job cannot answer them.
+With `mode: "review"` and an absolute `workspace`, Claude only receives Read, Glob, and Grep. Shell, file writes, hooks, plugins, skills, project instructions, and configured MCP servers are disabled. Place the patch to review in a file and name it in the question; review mode cannot run Git or tests.
+
+With an explicit absolute `workspace` and omitted mode (or `mode: "agent"`), Claude runs as a full autonomous coding agent. Its normal default tools, shell, file editing, user/project instructions and hooks, network access, and configured MCP servers, skills, and plugins remain available. Interactive permission prompts are bypassed because a detached job cannot answer them.
 
 The workspace is Claude's actual working directory and intended task scope, not a hard operating-system sandbox. Claude runs as the current user and can technically access other paths and the network. Only pass trusted workspaces and prompts.
 
@@ -30,10 +32,11 @@ Example:
 
 ```json
 {
-  "question": "Investigate the failure, implement a fix, run the relevant tests, and summarize the result.",
-  "model": "sonnet",
+  "question": "Read change.patch and the affected source files. Review for correctness and regressions; cite file paths and lines.",
+  "model": "claude-sonnet-5-5",
+  "mode": "review",
   "workspace": "/absolute/path/to/repository",
-  "name": "fix flaky integration test",
+  "name": "review recent change",
   "effort": "high",
   "max_budget_usd": 5
 }
@@ -42,6 +45,8 @@ Example:
 ## Persistence and diagnostics
 
 Jobs survive MCP server restarts and remain queryable by ID. Boot-aware recovery distinguishes a live detached runner from an interrupted job. Cancellation signals Claude's whole process group on POSIX systems, with a direct-child fallback on Windows.
+
+If an MCP request fails, reconnect and query the same `job_id`; use `list_jobs` if the start response was lost. Do not start a duplicate job or cancel a waiting job merely because output has not grown.
 
 Errors return structured `error_code`, `next_action`, `stderr_tail`, and `stderr_truncated` fields. Claude stderr is stored privately up to 1 MiB; only a bounded 4 KiB tail is returned. Output-limit errors warn that workspace changes may already exist.
 
@@ -63,5 +68,20 @@ An authenticated paid/limited-usage smoke test is opt-in:
 ```bash
 CLAUDE_ASK_LIVE=1 node scripts/test-server.mjs
 ```
+
+To review a real change and verify recovery during an MCP restart, prepare a
+workspace containing `change.patch` and the affected source and test files:
+
+```bash
+CLAUDE_ASK_LIVE=1 \
+CLAUDE_ASK_LIVE_REVIEW_WORKSPACE=/absolute/path/to/review-snapshot \
+CLAUDE_ASK_LIVE_MODEL=claude-sonnet-5-5 \
+node scripts/test-server.mjs
+```
+
+This checks the actual resolved model, read-only tool calls, discovery after
+restart, and a follow-up that recalls the earlier context. Set
+`CLAUDE_ASK_LIVE_RESULT_PATH` to save the answers and verification metadata.
+On a live-test failure, diagnostics and running jobs are retained for recovery.
 
 Optional controls are `CLAUDE_ASK_JOB_DIR`, `CLAUDE_ASK_MAX_CONCURRENT_JOBS`, `CLAUDE_ASK_MAX_OUTPUT_BYTES`, and `CLAUDE_ASK_COMPLETED_RETENTION_MS`. None sets a wall-clock or idle deadline.
