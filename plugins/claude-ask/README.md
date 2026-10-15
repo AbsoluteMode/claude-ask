@@ -20,11 +20,19 @@ Completed sessions remain resumable in Claude Code's normal session storage, out
 
 ## Access modes
 
-Without `workspace`, Claude runs in advisory safe mode with no tools and receives only the supplied question.
+With an absolute `workspace`, full `mode: "agent"` is the default for repository
+assistance, including implementation, investigation, and code reviews. Claude can
+run shell commands, inspect Git, edit files, and run tests. It inherits normal
+user/project instructions, hooks, network access, and configured MCP servers,
+skills, and plugins. Interactive permission prompts are bypassed because a
+detached job cannot answer them.
 
-With `mode: "review"` and an absolute `workspace`, Claude only receives Read, Glob, and Grep. Shell, file writes, hooks, plugins, skills, project instructions, and configured MCP servers are disabled. Place the patch to review in a file and name it in the question; review mode cannot run Git or tests.
+Without `workspace`, advisory mode receives only the question and has no tools.
 
-With an explicit absolute `workspace` and omitted mode (or `mode: "agent"`), Claude runs as a full autonomous coding agent. Its normal default tools, shell, file editing, user/project instructions and hooks, network access, and configured MCP servers, skills, and plugins remain available. Interactive permission prompts are bypassed because a detached job cannot answer them.
+`mode: "review"` is an optional restriction for an explicit read-only request.
+It exposes only Read, Glob, and Grep and disables shell, file writes,
+customizations, and MCP servers. It cannot run Git or tests. Follow-ups preserve
+the selected mode.
 
 The workspace is Claude's actual working directory and intended task scope, not a hard operating-system sandbox. Claude runs as the current user and can technically access other paths and the network. Only pass trusted workspaces and prompts.
 
@@ -32,11 +40,11 @@ Example:
 
 ```json
 {
-  "question": "Read change.patch and the affected source files. Review for correctness and regressions; cite file paths and lines.",
+  "question": "Investigate the failure, implement a fix, run the relevant tests, and summarize the result.",
   "model": "claude-sonnet-5-5",
-  "mode": "review",
+  "mode": "agent",
   "workspace": "/absolute/path/to/repository",
-  "name": "review recent change",
+  "name": "implement and verify a fix",
   "effort": "high",
   "max_budget_usd": 5
 }

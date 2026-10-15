@@ -11,11 +11,11 @@ Use Claude only when the user explicitly asks for consultation or delegation. Ve
 
 Send the desired result, observed facts, and material constraints. For an independent review, omit Codex's suspected cause and preferred fix from the initial request.
 
+- With an absolute `workspace`, use full `mode: "agent"` by default for repository help, including investigation and reviews. Claude can run shell commands, inspect Git, edit files, and run tests. It inherits user/project instructions, hooks, network access, and configured MCP servers, skills, and plugins. Interactive permission prompts are bypassed. Workspace is the intended task scope, not an OS sandbox.
 - Without `workspace`, advisory mode has no tools and receives only the question. Include all required evidence in the question.
-- With `workspace` and `mode: "review"`, Claude has only Read, Glob, and Grep. Shell, writes, hooks, skills, plugins, project customizations, and MCP servers are disabled. Provide a patch file and the relevant source files; this mode cannot run Git or tests.
-- With `workspace` and `mode: "agent"` (also the legacy default with workspace), Claude has full autonomous tools, shell, file writes, inherited instructions, hooks, network access, and configured MCP servers, skills, and plugins. Interactive permission prompts are bypassed. Workspace is the intended task scope, not an OS sandbox.
+- Use `mode: "review"` only when the user explicitly asks to restrict Claude to reading. This optional mode exposes Read, Glob, and Grep and disables shell, writes, hooks, skills, plugins, project customizations, and MCP servers.
 
-Use an absolute existing directory for workspace. Choose review mode for consultation about repository code; use agent mode when the user wants implementation or when explicitly authorized shell-based investigation is necessary.
+Describe the concrete work Claude should perform and the relevant constraints. A code review can use the full agent's Git and test tools; it does not require the restricted review mode.
 
 ## Model and effort
 

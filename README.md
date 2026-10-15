@@ -39,19 +39,19 @@ schemas are reloaded.
 Use a model alias or a full model ID such as `claude-sonnet-5-5`. The default
 is `claude-opus-5`, matching the existing personal installation.
 
-Without `workspace`, Claude receives only the supplied question and runs in
-safe mode with no tools.
+With an absolute `workspace`, full `mode: "agent"` is the default for repository
+assistance, including implementation, investigation, and code reviews. Claude can
+run shell commands, inspect Git, edit files, and run tests. It inherits normal
+user/project instructions, hooks, network access, and configured MCP servers,
+skills, and plugins. Interactive permission prompts are bypassed because a
+detached job cannot answer them.
 
-With `mode: "review"` and an absolute `workspace`, Claude can only use Read,
-Glob, and Grep. Shell, writes, hooks, plugins, project customizations, and MCP
-servers are disabled. Supply a patch file in the workspace when reviewing a
-Git diff; review mode cannot run Git or tests. Follow-ups retain this mode.
+Without `workspace`, advisory mode receives only the question and has no tools.
 
-With an explicit absolute `workspace` and omitted mode (or `mode: "agent"`),
-Claude runs as a full-access coding agent. Its default tools, shell, file editing, user/project instructions and
-hooks, network access, and configured MCP servers, skills, and plugins remain
-available. Interactive permission checks are bypassed because the detached
-process cannot answer prompts.
+`mode: "review"` is an optional restriction for an explicit read-only request.
+It exposes only Read, Glob, and Grep and disables shell, file writes,
+customizations, and MCP servers. It cannot run Git or tests. Follow-ups preserve
+the selected mode.
 
 The workspace is Claude's working directory and intended task scope, not a
 hard operating-system sandbox. Only pass trusted workspaces and prompts.
