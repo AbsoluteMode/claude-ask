@@ -1,6 +1,6 @@
 {
   "name": "claude-ask",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Use local Claude Code as a persistent full-access coding agent or independent second opinion from Codex.",
   "author": {
     "name": "max"
@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Claude Ask",
     "shortDescription": "Run persistent Claude Code agents and follow-ups.",
-    "longDescription": "Persistent Claude Code advice, read-only workspace reviews, and full coding agents with exact model selection, resumable follow-ups, progress, and structured diagnostics.",
+    "longDescription": "Run full Claude Code agents for repository assistance, implementation, diagnosis, and reviews, with exact models, persistent jobs, and resumable follow-ups. Read-only review is optional.",
     "developerName": "max",
     "category": "Productivity",
     "capabilities": [
@@ -29,7 +29,7 @@
     "defaultPrompt": [
       "Ask Opus for a quick independent opinion without repository tools.",
       "Ask Claude to investigate and fix this issue, then run the tests.",
-      "Ask Sonnet 5.5 for a read-only review of this implementation.",
+      "Ask Sonnet 5.5 to inspect this implementation and run the relevant checks.",
       "Continue the previous Claude job with a focused follow-up."
     ]
   }

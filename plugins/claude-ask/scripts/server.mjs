@@ -41,7 +41,7 @@ import {
 } from "./lib.mjs";
 
 const SERVER_NAME = "claude-ask";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 const RUNNER_PATH = fileURLToPath(new URL("./job-runner.mjs", import.meta.url));
 const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
 const SERVER_BOOT_STARTED_AT = Date.now() - uptime() * 1_000;
@@ -847,7 +847,7 @@ async function handleRequest(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        "Start Claude with ask and poll ask_status until a terminal result. Use mode=review with workspace for Read, Glob, and Grep only; agent mode enables full autonomous tools and writes. Without workspace, advisory mode has no tools. Use a full model ID to pin a version. ask_followup inherits the model, workspace, mode, and session; list_jobs recovers lost IDs. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit. A request failure does not cancel the job: reconnect and query its ID.",
+        "Start Claude with ask and poll ask_status until a terminal result. Use workspace with agent mode by default for repository assistance, shell commands, file edits, and tests. Use mode=review only when the user explicitly requests read-only tools. Without workspace, advisory mode has no tools. Use a full model ID to pin a version. ask_followup inherits the model, workspace, mode, and session; list_jobs recovers lost IDs. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit. A request failure does not cancel the job: reconnect and query its ID.",
     });
     return;
   }
@@ -864,7 +864,7 @@ async function handleRequest(message) {
           name: "ask",
           title: "Ask Claude",
           description:
-            "Start a persistent background Claude Code job using Opus 5 at high effort by default. Accepts Claude Code model aliases and full model IDs. Use mode=review with workspace for Read, Glob, and Grep only, with shell, edits, customizations, and MCP disabled. With workspace and no explicit mode, Claude runs as a full autonomous coding agent with default tools, shell commands, file editing, inherited user/project instructions and hooks, configured MCP servers, skills, and plugins, network access, and permission to modify files. Without workspace it receives only the question and no tools. Workspace is the working directory and intended task scope, not a hard OS sandbox. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
+            "Start a persistent background Claude Code job using Opus 5 at high effort by default. Accepts Claude Code model aliases and full model IDs. With workspace and no explicit mode, Claude runs as a full autonomous coding agent with default tools, shell commands, file editing, inherited user/project instructions and hooks, configured MCP servers, skills, and plugins, network access, and permission to modify files. Use mode=review only for an explicit read-only request; this restricts tools to Read, Glob, and Grep and disables customizations and MCP. Without workspace it receives only the question and no tools. Workspace is the working directory and intended task scope, not a hard OS sandbox. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
           inputSchema: {
             type: "object",
             properties: {
@@ -884,7 +884,7 @@ async function handleRequest(message) {
               mode: {
                 type: "string",
                 enum: ["advisory", "review", "agent"],
-                description: "Review uses only Read, Glob, and Grep and requires workspace. Agent allows shell and writes. Defaults to agent with workspace, advisory without it.",
+                description: "Defaults to full agent with workspace: shell, file edits, and tests. Advisory has no tools. Choose review only for an explicit read-only request (Read, Glob, Grep).",
               },
               workspace: {
                 type: "string",
