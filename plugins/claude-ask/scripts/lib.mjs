@@ -14,10 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export const DEFAULT_MODEL = "sonnet";
+export const DEFAULT_MODEL = "claude-opus-5";
 export const DEFAULT_EFFORT = "high";
-export const SUPPORTED_MODELS = new Set(["sonnet", "fable", "opus"]);
-export const SUPPORTED_EFFORTS = new Set(["medium", "high", "xhigh", "max"]);
+export const MODEL_PATTERN =
+  /^(?:sonnet|opus|fable|haiku|opusplan|claude-[a-z0-9][a-z0-9._-]*)(?:\[1m\])?$/;
+export const SUPPORTED_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 export const MAX_QUESTION_CHARS = 200_000;
 export const MAX_OUTPUT_BYTES = boundedInteger(
   process.env.CLAUDE_ASK_MAX_OUTPUT_BYTES,
@@ -56,6 +57,36 @@ export function validateWorkspace(value) {
   return canonical;
 }
 
+export function validateModel(value = DEFAULT_MODEL) {
+  if (
+    typeof value !== "string" ||
+    value.length > 128 ||
+    value !== value.trim() ||
+    !MODEL_PATTERN.test(value)
+  ) {
+    throw new Error(
+      "Model must be a Claude Code alias or full Claude model ID, such as `sonnet` or `claude-sonnet-5-5`.",
+    );
+  }
+  return value;
+}
+
+export function validateMode(value, workspace) {
+  const mode = value ?? (workspace ? "agent" : "advisory");
+  if (!["advisory", "review", "agent"].includes(mode)) {
+    throw new Error("Mode must be `advisory`, `review`, or `agent`.");
+  }
+  if (
+    (mode === "advisory" && workspace) ||
+    (mode !== "advisory" && !workspace)
+  ) {
+    throw new Error(
+      "Review and agent modes require a workspace; advisory mode requires omitting it.",
+    );
+  }
+  return mode;
+}
+
 export function validateJobName(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") {
@@ -71,7 +102,7 @@ export function validateJobName(value) {
 export function validateEffort(value, fallback = DEFAULT_EFFORT) {
   const effort = value ?? fallback;
   if (!SUPPORTED_EFFORTS.has(effort)) {
-    throw new Error("Effort must be `medium`, `high`, `xhigh`, or `max`.");
+    throw new Error("Effort must be `low`, `medium`, `high`, `xhigh`, or `max`.");
   }
   return effort;
 }
@@ -228,6 +259,12 @@ export function parseClaudeStream(stdout) {
   const initEvent = events.find(
     (event) => event?.type === "system" && event?.subtype === "init",
   );
+  const lastAssistant = events.findLast(
+    (event) =>
+      event?.type === "assistant" &&
+      !event.parent_tool_use_id &&
+      typeof event.message?.model === "string",
+  );
   return {
     event: resultEvent,
     result: {
@@ -237,7 +274,7 @@ export function parseClaudeStream(stdout) {
           : JSON.stringify(resultEvent.result ?? ""),
       requested_model: null,
       requested_effort: null,
-      resolved_model: initEvent?.model || null,
+      resolved_model: lastAssistant?.message.model || initEvent?.model || null,
       session_id: resultEvent.session_id || initEvent?.session_id || null,
       total_cost_usd: resultEvent.total_cost_usd ?? null,
       usage: resultEvent.usage || null,

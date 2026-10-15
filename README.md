@@ -1,18 +1,18 @@
 # Claude Ask
 
 Claude Ask is an open-source Codex plugin that runs a locally authenticated
-Claude Code Sonnet 5, Fable, or Opus model as an independent second opinion or
-full autonomous coding agent.
+Claude Code model as an independent second opinion or full autonomous coding
+agent.
 
 It provides five persistent asynchronous MCP tools:
 
-- `ask` starts a new advisory or workspace-agent job;
+- `ask` starts an advisory, read-only review, or workspace-agent job;
 - `ask_followup` resumes a completed Claude session and forks a new branch;
 - `ask_status` waits for progress or returns the final result;
 - `list_jobs` lists recent jobs and recovers lost IDs;
 - `cancel_ask` explicitly cancels a job and its process tree.
 
-Jobs support a human-readable name, `medium | high | xhigh | max` effort
+Jobs support a human-readable name, `low | medium | high | xhigh | max` effort
 (`high` by default), and an optional `max_budget_usd` ceiling.
 
 ## Install in Codex
@@ -36,11 +36,19 @@ schemas are reloaded.
 
 ## Access modes
 
+Use a model alias or a full model ID such as `claude-sonnet-5-5`. The default
+is `claude-opus-5`, matching the existing personal installation.
+
 Without `workspace`, Claude receives only the supplied question and runs in
 safe mode with no tools.
 
-With an explicit absolute `workspace`, Claude runs as a full-access coding
-agent. Its default tools, shell, file editing, user/project instructions and
+With `mode: "review"` and an absolute `workspace`, Claude can only use Read,
+Glob, and Grep. Shell, writes, hooks, plugins, project customizations, and MCP
+servers are disabled. Supply a patch file in the workspace when reviewing a
+Git diff; review mode cannot run Git or tests. Follow-ups retain this mode.
+
+With an explicit absolute `workspace` and omitted mode (or `mode: "agent"`),
+Claude runs as a full-access coding agent. Its default tools, shell, file editing, user/project instructions and
 hooks, network access, and configured MCP servers, skills, and plugins remain
 available. Interactive permission checks are bypassed because the detached
 process cannot answer prompts.
@@ -72,6 +80,8 @@ npm run check
 ```
 
 The default suite uses a fake Claude executable and consumes no model usage.
+It checks exact model IDs, low effort, read-only review, inherited restrictions,
+and job recovery after an MCP server restart.
 An authenticated paid/limited-usage smoke test is explicit:
 
 ```bash

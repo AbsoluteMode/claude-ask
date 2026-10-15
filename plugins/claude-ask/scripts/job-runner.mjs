@@ -20,6 +20,7 @@ import {
   safeClose,
   validateBudget,
   validateEffort,
+  validateMode,
   validateWorkspace,
 } from "./lib.mjs";
 
@@ -158,10 +159,12 @@ async function main() {
   const expectedBytes = Number(transferHeader?.bytes);
   const expectedDigest = transferHeader?.digest;
   let workspace;
+  let mode;
   let maxBudgetUsd;
   let resumeSessionId;
   try {
     workspace = validateWorkspace(transferHeader?.workspace);
+    mode = validateMode(transferHeader?.mode, workspace);
     maxBudgetUsd = validateBudget(transferHeader?.maxBudgetUsd);
     resumeSessionId =
       typeof transferHeader?.resumeSessionId === "string" &&
@@ -231,7 +234,7 @@ async function main() {
   if (maxBudgetUsd !== null) {
     commonArgs.push("--max-budget-usd", String(maxBudgetUsd));
   }
-  const args = workspace
+  const args = mode === "agent"
     ? [
         ...commonArgs,
         "--tools",
@@ -245,13 +248,18 @@ async function main() {
         "--safe-mode",
         "--disable-slash-commands",
         "--tools",
-        "",
+        mode === "review" ? "Read,Glob,Grep" : "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--allowedTools",
+        mode === "review" ? "Read,Glob,Grep" : "",
         "--permission-mode",
         "dontAsk",
       ];
   child = spawn(executable, args, {
     cwd: workspace || jobPath,
-    env: workspace
+    env: mode === "agent"
       ? process.env
       : { ...process.env, CLAUDE_CODE_SAFE_MODE: "1" },
     shell: false,
@@ -264,7 +272,7 @@ async function main() {
     model,
     effort,
     status: "running",
-    mode: workspace ? "agent" : "advisory",
+    mode,
     runnerPid: process.pid,
     claudePid: child.pid || null,
   });

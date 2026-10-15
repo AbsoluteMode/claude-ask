@@ -39,9 +39,19 @@ const agentInvocation =
   args.includes("--append-system-prompt") &&
   !args.includes("--safe-mode") &&
   !args.includes("--disable-slash-commands");
+const reviewInvocation =
+  toolsIndex >= 0 &&
+  args[toolsIndex + 1] === "Read,Glob,Grep" &&
+  args.includes("--safe-mode") &&
+  args.includes("--disable-slash-commands") &&
+  args.includes("--strict-mcp-config") &&
+  args.includes('{"mcpServers":{}}') &&
+  args.includes("dontAsk") &&
+  !args.includes("--dangerously-skip-permissions") &&
+  process.env.CLAUDE_CODE_SAFE_MODE === "1";
 const safeInvocation =
   requiredFlags.every((flag) => args.includes(flag)) &&
-  (noToolsInvocation || agentInvocation);
+  (noToolsInvocation || agentInvocation || reviewInvocation);
 
 let question = "";
 for await (const chunk of process.stdin) question += chunk;
@@ -166,6 +176,25 @@ if (!safeInvocation) {
       session_id: sessionId || "fake-session",
     });
     if (!defaultEffortInvocation) process.exitCode = 2;
+  } else if (question === "review-recall") {
+    const okay = reviewInvocation && forksSession && Boolean(resumeSessionId);
+    emit({
+      type: "result",
+      is_error: !okay,
+      result: okay ? "REVIEW_FOLLOWUP_OK" : "review follow-up lost restrictions",
+      session_id: "fake-review-followup-session",
+    });
+    if (!okay) process.exitCode = 2;
+  } else if (question.startsWith("review-probe:")) {
+    const okay =
+      reviewInvocation && process.cwd() === question.slice("review-probe:".length);
+    emit({
+      type: "result",
+      is_error: !okay,
+      result: okay ? "REVIEW_OK" : "review invocation mismatch",
+      session_id: sessionId,
+    });
+    if (!okay) process.exitCode = 2;
   } else if (question === "recall") {
     const followupInvocation =
       agentInvocation &&

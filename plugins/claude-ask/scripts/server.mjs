@@ -27,19 +27,21 @@ import {
   jobPaths,
   MAX_CONCURRENT_JOBS,
   MAX_QUESTION_CHARS,
+  MODEL_PATTERN,
   parseClaudeStream,
   questionDigest,
   readJson,
   streamSummary,
-  SUPPORTED_MODELS,
   validateBudget,
   validateEffort,
   validateJobName,
+  validateModel,
+  validateMode,
   validateWorkspace,
 } from "./lib.mjs";
 
 const SERVER_NAME = "claude-ask";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 const RUNNER_PATH = fileURLToPath(new URL("./job-runner.mjs", import.meta.url));
 const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
 const SERVER_BOOT_STARTED_AT = Date.now() - uptime() * 1_000;
@@ -102,7 +104,9 @@ function isValidJobState(state, expectedId) {
     state &&
       typeof state === "object" &&
       state.id === expectedId &&
-      SUPPORTED_MODELS.has(state.model) &&
+      typeof state.model === "string" &&
+      state.model.length <= 128 &&
+      MODEL_PATTERN.test(state.model) &&
       ["starting", "running", "completed", "error", "cancelled"].includes(
         state.status,
       ) &&
@@ -234,6 +238,7 @@ async function startClaudeJob({
   question,
   model,
   workspace,
+  mode = validateMode(undefined, workspace),
   name = null,
   effort = DEFAULT_EFFORT,
   maxBudgetUsd = null,
@@ -270,7 +275,7 @@ async function startClaudeJob({
     claudePid: null,
     launcherPid: process.pid,
     workspace,
-    mode: workspace ? "agent" : "advisory",
+    mode,
   });
 
   const runner = spawn(
@@ -298,6 +303,7 @@ async function startClaudeJob({
         bytes: questionBytes,
         digest,
         workspace,
+        mode,
         maxBudgetUsd,
         resumeSessionId,
       })}\n`,
@@ -527,7 +533,8 @@ async function handleToolCall(params) {
 
   if (toolName === "ask") {
     const question = args.question;
-    const model = args.model || DEFAULT_MODEL;
+    let model;
+    let mode;
     let workspace;
     let name;
     let effort;
@@ -546,15 +553,10 @@ async function handleToolCall(params) {
         "Shorten the question and retry.",
       );
     }
-    if (!SUPPORTED_MODELS.has(model)) {
-      return codedToolError(
-        "invalid_request",
-        "`model` must be `sonnet`, `fable`, or `opus`.",
-        "Choose a supported model alias.",
-      );
-    }
     try {
+      model = validateModel(args.model);
       workspace = validateWorkspace(args.workspace);
+      mode = validateMode(args.mode, workspace);
       name = validateJobName(args.name);
       effort = validateEffort(args.effort);
       maxBudgetUsd = validateBudget(args.max_budget_usd);
@@ -572,6 +574,7 @@ async function handleToolCall(params) {
         question,
         model,
         workspace,
+        mode,
         name,
         effort,
         maxBudgetUsd,
@@ -668,6 +671,7 @@ async function handleToolCall(params) {
         question,
         model: parent.state.model,
         workspace: parent.state.workspace || null,
+        mode: parent.state.mode || validateMode(undefined, parent.state.workspace),
         name,
         effort,
         maxBudgetUsd,
@@ -843,7 +847,7 @@ async function handleRequest(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        "Start Claude with ask and poll ask_status until the final answer. Use ask_followup to fork a completed session and list_jobs to recover job IDs. Pass workspace to run Claude Code as a full autonomous agent with its default tools, shell, editing, inherited user/project instructions and hooks, configured MCP servers, skills, plugins, network access, and permission to modify the workspace. Without workspace it receives only the question and no tools. Workspace is the working directory and intended task scope, not an OS sandbox. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit.",
+        "Start Claude with ask and poll ask_status until a terminal result. Use mode=review with workspace for Read, Glob, and Grep only; agent mode enables full autonomous tools and writes. Without workspace, advisory mode has no tools. Use a full model ID to pin a version. ask_followup inherits the model, workspace, mode, and session; list_jobs recovers lost IDs. Detached jobs survive MCP server restart and have no elapsed/idle deadline; cancellation is explicit. A request failure does not cancel the job: reconnect and query its ID.",
     });
     return;
   }
@@ -860,7 +864,7 @@ async function handleRequest(message) {
           name: "ask",
           title: "Ask Claude",
           description:
-            "Start a persistent background Claude Code job using Sonnet at high effort by default, with configurable effort plus Fable and Opus. With workspace, Claude runs as a full autonomous coding agent with default tools, shell commands, file editing, inherited user/project instructions and hooks, configured MCP servers, skills, and plugins, network access, and permission to modify files. Without workspace it receives only the question and no tools. The workspace is its working directory and intended task scope, not a hard OS sandbox. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
+            "Start a persistent background Claude Code job using Opus 5 at high effort by default. Accepts Claude Code model aliases and full model IDs. Use mode=review with workspace for Read, Glob, and Grep only, with shell, edits, customizations, and MCP disabled. With workspace and no explicit mode, Claude runs as a full autonomous coding agent with default tools, shell commands, file editing, inherited user/project instructions and hooks, configured MCP servers, skills, and plugins, network access, and permission to modify files. Without workspace it receives only the question and no tools. Workspace is the working directory and intended task scope, not a hard OS sandbox. Returns a job ID immediately; poll ask_status. There is no elapsed-time or idle-time deadline.",
           inputSchema: {
             type: "object",
             properties: {
@@ -872,16 +876,22 @@ async function handleRequest(message) {
               },
               model: {
                 type: "string",
-                enum: ["sonnet", "fable", "opus"],
+                pattern: MODEL_PATTERN.source,
+                maxLength: 128,
                 default: DEFAULT_MODEL,
-                description: "Claude Code model alias.",
+                description: "Claude Code alias or full model ID, for example sonnet or claude-sonnet-5-5.",
+              },
+              mode: {
+                type: "string",
+                enum: ["advisory", "review", "agent"],
+                description: "Review uses only Read, Glob, and Grep and requires workspace. Agent allows shell and writes. Defaults to agent with workspace, advisory without it.",
               },
               workspace: {
                 type: "string",
                 minLength: 1,
                 maxLength: 4096,
                 description:
-                  "Absolute existing working directory. Enables full autonomous Claude Code agent capabilities, including shell and file writes. This is the intended task scope, not a hard OS sandbox.",
+                  "Absolute existing working directory for review or agent mode. Omit for advisory questions. This is the intended task scope, not a hard OS sandbox.",
               },
               name: {
                 type: "string",
@@ -891,7 +901,7 @@ async function handleRequest(message) {
               },
               effort: {
                 type: "string",
-                enum: ["medium", "high", "xhigh", "max"],
+                enum: ["low", "medium", "high", "xhigh", "max"],
                 default: DEFAULT_EFFORT,
                 description: "Claude Code reasoning effort.",
               },
@@ -933,7 +943,7 @@ async function handleRequest(message) {
               },
               effort: {
                 type: "string",
-                enum: ["medium", "high", "xhigh", "max"],
+                enum: ["low", "medium", "high", "xhigh", "max"],
               },
               max_budget_usd: {
                 type: "number",

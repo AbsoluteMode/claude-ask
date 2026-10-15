@@ -1,40 +1,32 @@
 ---
 name: claude-ask
-description: Use when the user explicitly requests Claude, Sonnet, Fable, or Opus, or when an independent Claude perspective would materially improve a coding task, review, or diagnosis.
+description: Use when, and only when, the user explicitly asks Codex to consult or delegate work to Claude, Sonnet, Fable, or Opus. Do not use for mere mentions or because a second opinion might help.
 ---
 
 # Claude Ask
 
-Use Claude as an independent coding agent or second opinion. Treat its output as evidence to verify, not an authority to copy blindly.
+Use Claude only when the user explicitly asks for consultation or delegation. Verify its conclusions and edits independently.
 
-## Prompt and access
+## Request and access
 
-Send a complete, natural request with the desired result, observed facts, and material constraints. For an independent review or diagnosis, omit Codex's suspected cause and preferred fix from the initial question.
+Send the desired result, observed facts, and material constraints. For an independent review, omit Codex's suspected cause and preferred fix from the initial request.
 
-Pass the absolute `workspace` whenever Claude needs repository context. Workspace mode is a full autonomous Claude Code session: default tools, shell, file writes, user/project instructions and hooks, network access, and configured MCP servers, skills, and plugins remain available with bypassed interactive permission prompts. The workspace is the working directory and intended scope, not an OS sandbox. If the task is review-only, explicitly tell Claude not to edit.
+- Without `workspace`, advisory mode has no tools and receives only the question. Include all required evidence in the question.
+- With `workspace` and `mode: "review"`, Claude has only Read, Glob, and Grep. Shell, writes, hooks, skills, plugins, project customizations, and MCP servers are disabled. Provide a patch file and the relevant source files; this mode cannot run Git or tests.
+- With `workspace` and `mode: "agent"` (also the legacy default with workspace), Claude has full autonomous tools, shell, file writes, inherited instructions, hooks, network access, and configured MCP servers, skills, and plugins. Interactive permission prompts are bypassed. Workspace is the intended task scope, not an OS sandbox.
 
-Without `workspace`, Claude receives only the question and has no tools. Use that mode for self-contained advice.
+Use an absolute existing directory for workspace. Choose review mode for consultation about repository code; use agent mode when the user wants implementation or when explicitly authorized shell-based investigation is necessary.
 
-## Choose cost and depth
+## Model and effort
 
-| Setting | Use |
-|---|---|
-| `sonnet` | Default for implementation, diagnosis, and review |
-| `opus` | High-risk security, concurrency, state, or data-loss work; or explicit request |
-| `fable` | Only when explicitly requested |
-| `medium` effort | Quick, bounded questions |
-| `high` effort | Default |
-| `xhigh` effort | Difficult multi-file or ambiguous work |
-| `max` effort | Exceptional cases where depth justifies the cost |
+Model aliases (`sonnet`, `opus`, `fable`, `haiku`) track Claude Code's configured targets. To honor a requested version, pass its full ID, for example `claude-sonnet-5-5` for Sonnet 5.5. Check `resolved_model` and `model_usage` in the result rather than relying on the requested name. The default remains `claude-opus-5` with `high` effort.
 
-Use `name` for recognizable jobs and `max_budget_usd` when cost needs a hard ceiling.
+Effort supports `low`, `medium`, `high`, `xhigh`, and `max`. Use `name` to identify jobs and `max_budget_usd` when a cost ceiling is wanted.
 
-## Job workflow
+## Finish the conversation
 
-1. Call `ask`; retain its `job_id`.
-2. Poll `ask_status` with `previous_output_bytes` and `wait_ms=30000` until `completed`, `error`, or `cancelled`. Idle output is not failure.
-3. Use `list_jobs` to recover a lost ID or inspect recent work.
-4. Use `ask_followup` only after completion when Claude should retain the parent session context. It inherits model, workspace, and effort unless overridden, then forks a new session branch. Budget is set per call. Claude stores resumable sessions outside the plugin's job directory.
-5. Use `cancel_ask` only for an explicit cancellation or a clearly replaced request.
-
-Inspect Claude's edits and verification independently before reporting success.
+1. Call `ask` and retain `job_id`; the response may already be terminal.
+2. Poll `ask_status` with `previous_output_bytes` and `wait_ms=30000` until `completed`, `error`, or `cancelled`. Idle output is not failure and is never a reason to cancel.
+3. If the MCP connection fails, reconnect and query the same job. Use `list_jobs` to recover a lost ID before starting another request. Detached jobs survive MCP restarts.
+4. Use `ask_followup` after successful completion to retain the model, workspace, access mode, effort, and session context. It forks an independent session; the budget is per call.
+5. On errors, inspect `error_code`, `next_action`, and `stderr_tail`; report a terminal failure instead of claiming success. Cancel only for an explicit cancellation or a clearly replaced request.
